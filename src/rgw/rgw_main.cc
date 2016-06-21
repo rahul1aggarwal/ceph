@@ -203,6 +203,58 @@ struct RGWRequest
 
 };
 
+/* This is a wrapper to hold all the objects necessary to process a request */
+struct RGWRequestInfo {
+  
+  RGWRados *store;
+  RGWREST *rest;
+  RGWRequest *req;
+  RGWClientIO *client_io;
+  OpsLogSocket *olog;
+  req_state *s;
+  RGWHandler *handler;
+  RGWOp *op;
+
+
+  RGWRequestInfo() {
+    this->store = NULL;
+    this->rest = NULL;
+    this->req = NULL;
+    this->client_io = NULL;
+    this->olog = NULL;
+    this->s = NULL;
+    this->handler = NULL;
+    this->op = NULL;
+  }
+
+  virtual ~RGWRequestInfo() {}
+
+  /* finish a request both in case of success as well as failure at any stage during processing */
+  int post_process_request(bool should_log, int ret) {
+    int r = client_io->complete_request();
+    if (r < 0) {
+      dout(0) << "ERROR: client_io->complete_request() returned " << r << dendl;
+    }
+    if (should_log) {
+      rgw_log_op(store, s, (op ? op->name() : "unknown"), olog);
+    }
+
+    int http_ret = s->err.http_ret;
+
+    req->log_format(s, "http status=%d", http_ret);
+
+    if (handler)
+      handler->put_op(op);
+    rest->put_handler(handler);
+    utime_t req_serve_time = req->time_elapsed();
+    dout(1) << "DSS API LOGGING: ====== req done trans=" << s->trans_id.c_str() << " http_status=" << http_ret << 
+      " req_serving_time= " << req_serve_time << " ======" << dendl;
+
+    return (ret < 0 ? ret : s->err.ret);
+  }
+
+};
+
 class RGWFrontendConfig {
   string config;
   map<string, string> config_map;
@@ -662,24 +714,36 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
     }
   }
 
+  RGWRequestInfo req_info;
+ 
+  req_info.store = store;
+  req_info.rest = rest;
+  req_info.req = req;
+  req_info.client_io = client_io;
+  req_info.olog = olog;
+  req_info.s = s;
+
+
 
   RGWOp *op = NULL;
   int init_error = 0;
   bool should_log = false;
   RGWRESTMgr *mgr;
   RGWHandler *handler = rest->get_handler(store, s, client_io, &mgr, &init_error);
+  req_info.handler = handler;
   if (init_error != 0) {
     abort_early(s, NULL, init_error);
-    goto done;
+    return req_info.post_process_request(should_log, ret);
   }
 
   should_log = mgr->get_logging();
 
   req->log(s, "getting op");
   op = handler->get_op(store);
+  req_info.op = op;
   if (!op) {
     abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED);
-    goto done;
+    return req_info.post_process_request(should_log, ret);
   }
   req->op = op;
 
@@ -688,13 +752,13 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   if (ret < 0) {
     dout(10) << "failed to authorize request" << dendl;
     abort_early(s, op, ret);
-    goto done;
+    return req_info.post_process_request(should_log, ret);
   }
 
   if (s->user.suspended) {
     dout(10) << "user is suspended, uid=" << s->user.user_id << dendl;
     abort_early(s, op, -ERR_USER_SUSPENDED);
-    goto done;
+    return req_info.post_process_request(should_log, ret);
   }
 
   // This reads the ACL on the bucket or object
@@ -702,7 +766,7 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   ret = handler->read_permissions(op);
   if (ret < 0) {
     abort_early(s, op, ret);
-    goto done;
+    return req_info.post_process_request(should_log, ret);
   }
 
   // This basically looks into quotas associated with users
@@ -710,14 +774,14 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   ret = op->init_processing();
   if (ret < 0) {
     abort_early(s, op, ret);
-    goto done;
+    return req_info.post_process_request(should_log, ret);
   }
 
   req->log(s, "verifying op mask");
   ret = op->verify_op_mask();
   if (ret < 0) {
     abort_early(s, op, ret);
-    goto done;
+    return req_info.post_process_request(should_log, ret);
   }
 
   req->log(s, "verifying op permissions");
@@ -727,7 +791,7 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
       dout(2) << "overriding permissions due to system operation" << dendl;
     } else {
       abort_early(s, op, ret);
-      goto done;
+      return req_info.post_process_request(should_log, ret);
     }
   }
 
@@ -735,14 +799,15 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   ret = op->verify_params();
   if (ret < 0) {
     abort_early(s, op, ret);
-    goto done;
+    return req_info.post_process_request(should_log, ret);
   }
 
   req->log(s, "executing");
   op->pre_exec();
   op->execute();
   op->complete();
-done:
+  return req_info.post_process_request(should_log, ret);
+  /* 
   int r = client_io->complete_request();
   if (r < 0) {
     dout(0) << "ERROR: client_io->complete_request() returned " << r << dendl;
@@ -762,7 +827,35 @@ done:
   dout(1) << "DSS API LOGGING: ====== req done trans=" << s->trans_id.c_str() << " http_status=" << http_ret << " req_serving_time= " << req_serve_time << " ======" << dendl;
 
   return (ret < 0 ? ret : s->err.ret);
+  */
 }
+
+/*
+static int post_process_request(RGWRequestInfo *req_info)
+{
+  int r = client_io->complete_request();
+  if (r < 0) {
+    dout(0) << "ERROR: client_io->complete_request() returned " << r << dendl;
+  }
+  if (should_log) {
+    rgw_log_op(store, s, (op ? op->name() : "unknown"), olog);
+  }
+
+  int http_ret = s->err.http_ret;
+
+  req->log_format(s, "http status=%d", http_ret);
+
+  if (handler)
+    handler->put_op(op);
+  rest->put_handler(handler);
+  utime_t req_serve_time = req->time_elapsed();
+  dout(1) << "DSS API LOGGING: ====== req done trans=" << s->trans_id.c_str() << " http_status=" << http_ret << " req_serving_time= " << req_serve_time << " ======" << dendl;
+
+  return (ret < 0 ? ret : s->err.ret);
+
+}
+
+*/
 
 void RGWFCGXProcess::handle_request(RGWRequest *r)
 {
@@ -821,17 +914,11 @@ static int civetweb_callback(struct mg_connection *conn) {
   RGWREST *rest = pe->rest;
   OpsLogSocket *olog = pe->olog;
 
- /*
- (store->auth_method).set_token_validation(false);
-  (store->auth_method).set_copy_action(false);
-  (store->auth_method).set_url_type_token(false);
-  (store->auth_method).set_acl_main_override(false);
-  (store->auth_method).set_acl_copy_override(false);
-*/
   /* Go through all the headers to find out if the authentication
    * method required is EC2 signature or tokens.
    * While there can be at most 100 header fields in a HTTP request,
-   * http_headers is an array of size 64 elements inside civetweb */
+   * http_headers is an array of size 64 elements inside civetweb 
+   */
   dout(1) << "DSS API LOGGING: ====== starting new request ======" << dendl;
 
   dout(1) << "DSS INFO: Printing received headers: Total number of received headers are: " << req_info->num_headers << dendl;
@@ -860,35 +947,8 @@ static int civetweb_callback(struct mg_connection *conn) {
           }
 
           dout(1) << "DSS API LOGGING: " << name_str << " : "<< value_str << dendl;
-
-        /*
-          if (name_str.compare("X-Auth-Token") == 0) {
-              // This request has a token not EC2 credentials
-              (store->auth_method).set_token_validation(true);
-              // Fill the token string even if it is blank
-              // Keystone will handle the rest
-              (store->auth_method).set_token(value_str);
-          }
-          
-          if (
-             (((name_str.compare("x-amz-metadata-directive") == 0)
-             || (name_str.compare("x-jcs-metadata-directive")))
-             && (value_str.compare("COPY") == 0)) ||
-             ((name_str.compare("x-amz-copy-source") == 0)
-             || (name_str.compare("x-jcs-copy-source") == 0) )) {
-
-              // Mark the bool value if this request if for COPY.
-              // If the copy source is provided, store that. Else, down the line throw an error.
-              (store->auth_method).set_copy_action(true);
-              if ((name_str.compare("x-amz-copy-source") == 0)
-               || (name_str.compare("x-jcs-copy-source") == 0)) {
-                  (store->auth_method).set_copy_source(value_str);
-              }
-          }
-          */
       }
   }
-  //dout(1) << "DSS INFO: token validation set to: " << (store->auth_method).get_token_validation() << dendl;
 
   RGWRequest *req = new RGWRequest(store->get_new_req_id());
   RGWMongoose client_io(conn, pe->port);
