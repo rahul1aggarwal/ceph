@@ -1069,6 +1069,22 @@ OPTION(rgw_cors_content_disposition_header, OPT_STR, "Content-Disposition") // c
 OPTION(rgw_cors_content_disposition_header_value, OPT_STR, "attachment") // cors content disposition HEADER value
 OPTION(rgw_enable_token_based_presigned_url, OPT_BOOL, true) // enable token based presigned url
 OPTION(rgw_enable_infinite_token_based_presigned_url, OPT_BOOL, true) // enable infinite token based presigned url
+OPTION(rgw_enforce_sla, OPT_BOOL, false) // enable sla for each request
+OPTION(rgw_get_obj_sla_time, OPT_U32, 2) // sla time for get object
+OPTION(rgw_list_buckets_sla_time, OPT_U32, 5) // sla time for list buckets 
+OPTION(rgw_list_bucket_sla_time, OPT_U32, 5) // sla time for list bucket (1000 objects)
+OPTION(rgw_stat_bucket_sla_time, OPT_U32, 2) // sla time for head bucket
+OPTION(rgw_create_bucket_sla_time, OPT_U32, 2) // sla time for create bucket
+OPTION(rgw_delete_bucket_sla_time, OPT_U32, 2) // sla time for delete bucket
+OPTION(rgw_put_obj_sla_time, OPT_U32, 2) // sla time for put object
+OPTION(rgw_delete_obj_sla_time, OPT_U32, 2) // sla time for delete object
+OPTION(rgw_copy_obj_sla_time, OPT_U32, 2) // sla time for copy object
+OPTION(rgw_init_multipart_sla_time, OPT_U32, 2) // sla time for initiate multipart
+OPTION(rgw_complete_multipart_sla_time, OPT_U32, 2) // sla time for complete multipart
+OPTION(rgw_abort_multipart_sla_time, OPT_U32, 2) // sla time for abort multipart
+OPTION(rgw_list_multipart_sla_time, OPT_U32, 5) // sla time for list multipart (1000 parts)
+OPTION(rgw_list_bucket_multiparts_sla_time, OPT_U32, 5) // sla time for list multiparts in a bucket (1000 multiparts)
+
 
 
 OPTION(rgw_disable_acl_api, OPT_BOOL, true)             // disable all acl getters and setters

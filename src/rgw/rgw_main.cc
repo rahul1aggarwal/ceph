@@ -203,57 +203,116 @@ struct RGWRequest
 
 };
 
-/* This is a wrapper to hold all the objects necessary to process a request */
-struct RGWRequestInfo {
-  
-  RGWRados *store;
-  RGWREST *rest;
-  RGWRequest *req;
-  RGWClientIO *client_io;
-  OpsLogSocket *olog;
-  req_state *s;
-  RGWHandler *handler;
-  RGWOp *op;
-
-
-  RGWRequestInfo() {
-    this->store = NULL;
-    this->rest = NULL;
-    this->req = NULL;
-    this->client_io = NULL;
-    this->olog = NULL;
-    this->s = NULL;
-    this->handler = NULL;
-    this->op = NULL;
-  }
-
-  virtual ~RGWRequestInfo() {}
-
-  /* finish a request both in case of success as well as failure at any stage during processing */
-  int post_process_request(bool should_log, int ret) {
-    int r = client_io->complete_request();
-    if (r < 0) {
-      dout(0) << "ERROR: client_io->complete_request() returned " << r << dendl;
-    }
-    if (should_log) {
-      rgw_log_op(store, s, (op ? op->name() : "unknown"), olog);
-    }
-
-    int http_ret = s->err.http_ret;
-
-    req->log_format(s, "http status=%d", http_ret);
-
-    if (handler)
-      handler->put_op(op);
-    rest->put_handler(handler);
-    utime_t req_serve_time = req->time_elapsed();
-    dout(1) << "DSS API LOGGING: ====== req done trans=" << s->trans_id.c_str() << " http_status=" << http_ret << 
-      " req_serving_time= " << req_serve_time << " ======" << dendl;
-
-    return (ret < 0 ? ret : s->err.ret);
-  }
-
+enum RGWRequestSLAStatus {
+  ACTIVE, // request is currently active from SLA perspective
+  ERROR, // request has gone into error
+  SLA_MET, // request has successfully met the SLA
+  SLA_NOT_MET, // request has not met the SLA
 };
+
+/* This is a wrapper to hold all the objects necessary to process a request */
+class RGWRequestSLA {
+
+  friend class RGWSLAManager;
+
+  utime_t req_start_time; // start time when a civetweb thread started processing this request
+  RGWRequest *req; // Request object
+  RGWRequestSLAStatus sla_status; // SLA status of this request
+  RGWHandler *handler; // S3 handler in our case
+ 
+  public :
+
+  RGWRequestSLA() {
+  }
+
+  virtual ~RGWRequestSLA() {}
+
+  
+  
+};
+
+class RGWSLAManager {
+
+  map<string, RGWRequestSLA*> requests_map; // map of transaction id to request
+  uint32_t sla_config_times[64]; // array containing the configured SLA time for each RGWOpType 
+
+  Mutex *m_mutex; // mutex to synchronize access to the map
+  
+  struct RGWProcessEnv *rgw_env; // RGW environment (civetweb)
+  
+  public :
+  RGWSLAManager(RGWProcessEnv *env) : rgw_env(env) {
+    m_mutex = new Mutex("sla_map_mutex");
+    /* populate the sla config array */
+    int i = 0;
+    for(; i < 64; i++) {
+      sla_config_times[i] = 0;
+    }
+
+    sla_config_times[RGW_OP_GET_OBJ] = g_conf->rgw_get_obj_sla_time;
+    sla_config_times[RGW_OP_LIST_BUCKETS] = g_conf->rgw_list_buckets_sla_time;
+    sla_config_times[RGW_OP_LIST_BUCKET] = g_conf->rgw_list_bucket_sla_time;
+    sla_config_times[RGW_OP_STAT_BUCKET] = g_conf->rgw_stat_bucket_sla_time;
+    sla_config_times[RGW_OP_CREATE_BUCKET] = g_conf->rgw_create_bucket_sla_time;
+    sla_config_times[RGW_OP_DELETE_BUCKET] = g_conf->rgw_delete_bucket_sla_time;
+    sla_config_times[RGW_OP_PUT_OBJ] = g_conf->rgw_put_obj_sla_time;
+    sla_config_times[RGW_OP_DELETE_OBJ] = g_conf->rgw_delete_obj_sla_time;
+    sla_config_times[RGW_OP_COPY_OBJ] = g_conf->rgw_copy_obj_sla_time;
+    sla_config_times[RGW_OP_INIT_MULTIPART] = g_conf->rgw_init_multipart_sla_time;
+    sla_config_times[RGW_OP_COMPLETE_MULTIPART] = g_conf->rgw_complete_multipart_sla_time;
+    sla_config_times[RGW_OP_ABORT_MULTIPART] = g_conf->rgw_abort_multipart_sla_time;
+    sla_config_times[RGW_OP_LIST_MULTIPART] = g_conf->rgw_list_multipart_sla_time;
+    sla_config_times[RGW_OP_LIST_BUCKET_MULTIPARTS] = g_conf->rgw_list_bucket_multiparts_sla_time;
+
+  }
+
+  virtual ~RGWSLAManager() {}
+
+  void register_request(string trans_id, RGWRequestSLA);
+  void deregister_request(string trans_id);
+  
+  void run() {
+    struct timespec sleep_time_10ms;
+    sleep_time_10ms.tv_sec = 0;
+    sleep_time_10ms.tv_nsec = 10000L;
+    while(1) {
+      m_mutex->Lock();
+      /* get current time */
+      utime_t cur_time = ceph_clock_now(g_ceph_context);
+      /* iterate over the map and check sla for each request */
+      map<string, RGWRequestSLA*>::iterator iter = requests_map.begin();
+      while(iter != requests_map.end()) {
+        RGWRequestSLA *req = iter->second;
+        uint32_t sla_time = get_sla_time(req);
+        
+        ++iter;
+      }
+      m_mutex->Unlock();
+      nanosleep(&sleep_time_10ms, NULL);
+    }
+  }
+
+  private :
+  uint32_t get_sla_time(RGWRequestSLA *req) {
+    return sla_config_times[req->req->op->get_type()];
+  }
+  int post_process_request();
+  
+  
+};
+ 
+void *sla_thread_func(void *args) 
+{
+  string frontends = g_conf->rgw_frontends;
+  RGWSLAManager *mgr = (RGWSLAManager *) args;
+  mgr->run();
+  return NULL;
+}
+
+void start_sla_thread(RGWSLAManager *mgr) {
+  pthread_t sla_thread;
+  pthread_create(&sla_thread, NULL, sla_thread_func, (void *) mgr);
+}
 
 class RGWFrontendConfig {
   string config;
@@ -657,6 +716,35 @@ static void godown_alarm(int signum)
   _exit(0);
 }
 
+static int post_process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, OpsLogSocket *olog, 
+                                RGWHandler *handler, bool should_log, int ret)
+{
+  req_state *s = req->s;
+  RGWClientIO *client_io = s->cio;
+  RGWOp *op = req->op;
+  int r = client_io->complete_request();
+  if (r < 0) {
+    dout(0) << "ERROR: client_io->complete_request() returned " << r << dendl;
+  }
+  if (should_log) {
+    rgw_log_op(store, s, (op ? op->name() : "unknown"), olog);
+  }
+
+  int http_ret = s->err.http_ret;
+
+  req->log_format(s, "http status=%d", http_ret);
+
+  if (handler)
+    handler->put_op(op);
+  rest->put_handler(handler);
+  utime_t req_serve_time = req->time_elapsed();
+  dout(1) << "DSS API LOGGING: ====== req done trans=" << s->trans_id.c_str() << " http_status=" << http_ret << " req_serving_time= " << req_serve_time << " ======" << dendl;
+
+  return (ret < 0 ? ret : s->err.ret);
+
+}
+
+
 static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWClientIO *client_io, OpsLogSocket *olog)
 {
   int ret = 0;
@@ -714,15 +802,6 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
     }
   }
 
-  RGWRequestInfo req_info;
- 
-  req_info.store = store;
-  req_info.rest = rest;
-  req_info.req = req;
-  req_info.client_io = client_io;
-  req_info.olog = olog;
-  req_info.s = s;
-
 
 
   RGWOp *op = NULL;
@@ -730,20 +809,18 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   bool should_log = false;
   RGWRESTMgr *mgr;
   RGWHandler *handler = rest->get_handler(store, s, client_io, &mgr, &init_error);
-  req_info.handler = handler;
   if (init_error != 0) {
     abort_early(s, NULL, init_error);
-    return req_info.post_process_request(should_log, ret);
+    return post_process_request(store, rest, req, olog, handler,should_log, ret);
   }
 
   should_log = mgr->get_logging();
 
   req->log(s, "getting op");
   op = handler->get_op(store);
-  req_info.op = op;
   if (!op) {
     abort_early(s, NULL, -ERR_METHOD_NOT_ALLOWED);
-    return req_info.post_process_request(should_log, ret);
+    return post_process_request(store, rest, req, olog, handler,should_log, ret);
   }
   req->op = op;
 
@@ -752,13 +829,13 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   if (ret < 0) {
     dout(10) << "failed to authorize request" << dendl;
     abort_early(s, op, ret);
-    return req_info.post_process_request(should_log, ret);
+    return post_process_request(store, rest, req, olog, handler,should_log, ret);
   }
 
   if (s->user.suspended) {
     dout(10) << "user is suspended, uid=" << s->user.user_id << dendl;
     abort_early(s, op, -ERR_USER_SUSPENDED);
-    return req_info.post_process_request(should_log, ret);
+    return post_process_request(store, rest, req, olog, handler,should_log, ret);
   }
 
   // This reads the ACL on the bucket or object
@@ -766,7 +843,7 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   ret = handler->read_permissions(op);
   if (ret < 0) {
     abort_early(s, op, ret);
-    return req_info.post_process_request(should_log, ret);
+    return post_process_request(store, rest, req, olog, handler,should_log, ret);
   }
 
   // This basically looks into quotas associated with users
@@ -774,14 +851,14 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   ret = op->init_processing();
   if (ret < 0) {
     abort_early(s, op, ret);
-    return req_info.post_process_request(should_log, ret);
+    return post_process_request(store, rest, req, olog, handler,should_log, ret);
   }
 
   req->log(s, "verifying op mask");
   ret = op->verify_op_mask();
   if (ret < 0) {
     abort_early(s, op, ret);
-    return req_info.post_process_request(should_log, ret);
+    return post_process_request(store, rest, req, olog, handler,should_log, ret);
   }
 
   req->log(s, "verifying op permissions");
@@ -791,7 +868,7 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
       dout(2) << "overriding permissions due to system operation" << dendl;
     } else {
       abort_early(s, op, ret);
-      return req_info.post_process_request(should_log, ret);
+      return post_process_request(store, rest, req, olog, handler,should_log, ret);
     }
   }
 
@@ -799,63 +876,15 @@ static int process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, RGWC
   ret = op->verify_params();
   if (ret < 0) {
     abort_early(s, op, ret);
-    return req_info.post_process_request(should_log, ret);
+    return post_process_request(store, rest, req, olog, handler,should_log, ret);
   }
 
   req->log(s, "executing");
   op->pre_exec();
   op->execute();
   op->complete();
-  return req_info.post_process_request(should_log, ret);
-  /* 
-  int r = client_io->complete_request();
-  if (r < 0) {
-    dout(0) << "ERROR: client_io->complete_request() returned " << r << dendl;
-  }
-  if (should_log) {
-    rgw_log_op(store, s, (op ? op->name() : "unknown"), olog);
-  }
-
-  int http_ret = s->err.http_ret;
-
-  req->log_format(s, "http status=%d", http_ret);
-
-  if (handler)
-    handler->put_op(op);
-  rest->put_handler(handler);
-  utime_t req_serve_time = req->time_elapsed();
-  dout(1) << "DSS API LOGGING: ====== req done trans=" << s->trans_id.c_str() << " http_status=" << http_ret << " req_serving_time= " << req_serve_time << " ======" << dendl;
-
-  return (ret < 0 ? ret : s->err.ret);
-  */
+  return post_process_request(store, rest, req, olog, handler,should_log, ret);
 }
-
-/*
-static int post_process_request(RGWRequestInfo *req_info)
-{
-  int r = client_io->complete_request();
-  if (r < 0) {
-    dout(0) << "ERROR: client_io->complete_request() returned " << r << dendl;
-  }
-  if (should_log) {
-    rgw_log_op(store, s, (op ? op->name() : "unknown"), olog);
-  }
-
-  int http_ret = s->err.http_ret;
-
-  req->log_format(s, "http status=%d", http_ret);
-
-  if (handler)
-    handler->put_op(op);
-  rest->put_handler(handler);
-  utime_t req_serve_time = req->time_elapsed();
-  dout(1) << "DSS API LOGGING: ====== req done trans=" << s->trans_id.c_str() << " http_status=" << http_ret << " req_serving_time= " << req_serve_time << " ======" << dendl;
-
-  return (ret < 0 ? ret : s->err.ret);
-
-}
-
-*/
 
 void RGWFCGXProcess::handle_request(RGWRequest *r)
 {
@@ -913,12 +942,7 @@ static int civetweb_callback(struct mg_connection *conn) {
   RGWRados *store = pe->store;
   RGWREST *rest = pe->rest;
   OpsLogSocket *olog = pe->olog;
-
-  /* Go through all the headers to find out if the authentication
-   * method required is EC2 signature or tokens.
-   * While there can be at most 100 header fields in a HTTP request,
-   * http_headers is an array of size 64 elements inside civetweb 
-   */
+  
   dout(1) << "DSS API LOGGING: ====== starting new request ======" << dendl;
 
   dout(1) << "DSS INFO: Printing received headers: Total number of received headers are: " << req_info->num_headers << dendl;
@@ -934,6 +958,7 @@ static int civetweb_callback(struct mg_connection *conn) {
 
   dout(1) << "DSS API LOGGING:" << req_str.c_str() << dendl;
 
+  /* dump the headers */
   for (int i = 0; i < req_info->num_headers; i++) {
       if ((req_info->http_headers[i]).name != NULL) {
           string name_str((req_info->http_headers[i]).name);
