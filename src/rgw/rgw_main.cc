@@ -235,7 +235,8 @@ class RGWRequestSLA {
 
   public :
 
-  RGWRequestSLA(RGWRequest* req, RGWHandler* handler) : req(req), handler(handler) {
+  RGWRequestSLA(RGWRequest* req, RGWHandler* handler, utime_t start_time, bool should_log) : 
+  req(req), handler(handler), req_start_time(start_time), should_log(should_log) {
     r_mutex = new Mutex("sla_req_mutex");
     sla_status = ACTIVE;
   }
@@ -261,22 +262,29 @@ class RGWRequestSLA {
     sla_status = status;
     r_mutex->Unlock();
   }
+  
+  RGWRequestSLAStatus set_sla_met_for_request() {
+    r_mutex->Lock();
+    if(sla_status == ACTIVE) {
+      sla_status = SLA_MET;
+    }
+    RGWRequestSLAStatus ret = sla_status;
+    r_mutex->Unlock();
+    return ret;
+  }
+
  
   void handle_sla_violation(RGWProcessEnv* env, utime_t time_to_meet_sla, utime_t cur_time) {
     // abort early, post process 
     r_mutex->Lock();
     if(sla_status == ACTIVE) {
+      /* only an active request can violate sla */
       abort_early(req->s, NULL, -ERR_INTERNAL_ERROR);
       post_process_request(env->store, env->rest, req, env->olog, handler, should_log, 0);
-      /* only an active request can violate sla */
       sla_status = SLA_NOT_MET;
     }
     r_mutex->Unlock();
   }
-
-
-  
-  
 };
 
 /* wrapper to hold all objects necessary to process a request which has violated the SLA */
@@ -292,7 +300,7 @@ void* handle_sla_violation_func(void* sla_violation_info) {
   RGWSLAViolationInfo* sla_info = (RGWSLAViolationInfo*) sla_violation_info;
   sla_info->req->handle_sla_violation(sla_info->env, sla_info->time_to_meet_sla, sla_info->cur_time);
   delete(sla_info);
-  return NULL;
+  return NULL; // satisfy compiler
 }
 
 class RGWSLAManager {
@@ -333,8 +341,47 @@ class RGWSLAManager {
 
   virtual ~RGWSLAManager() {}
 
-  void register_request(string trans_id, RGWRequestSLA);
-  void deregister_request(string trans_id);
+  void register_request(string trans_id, RGWRequestSLA* req) {
+    m_mutex->Lock();
+    requests_map[trans_id] = req;
+    m_mutex->Unlock();
+  }
+
+  void deregister_request(string trans_id) {
+    m_mutex->Lock();
+    requests_map.erase(trans_id);
+    m_mutex->Unlock();
+  }
+
+  RGWRequestSLA* get_sla_request(string trans_id) {
+    m_mutex->Lock();
+    RGWRequestSLA* req = NULL;
+    map<string, RGWRequestSLA*>::iterator iter = requests_map.find(trans_id);
+    if(iter != requests_map.end()) {
+      req = iter->second;
+    }
+    m_mutex->Unlock();
+    return req;
+  }
+
+
+  RGWRequestSLAStatus set_sla_met_for_request(string trans_id) {
+    RGWRequestSLAStatus ret = ERROR;
+    m_mutex->Lock();
+    map<string, RGWRequestSLA*>::iterator iter = requests_map.find(trans_id);
+    if(iter != requests_map.end()) {
+      RGWRequestSLA* req = iter->second;
+      ret = req->set_sla_met_for_request();
+    }
+    m_mutex->Unlock();
+    return ret;
+  }
+
+  
+  RGWRequestSLAStatus get_request_status(string trans_id) {
+    m_mutex->Lock();
+    m_mutex->Unlock();
+  }
   
   void run() {
     struct timespec sleep_time_10ms;
@@ -355,7 +402,7 @@ class RGWSLAManager {
         uint64_t time_to_meet_sla_in_msec = req_start_time.to_msec();   
         if(cur_time_in_msec > time_to_meet_sla_in_msec) {
           /* SLA not met, abort */
-          req->handle_sla_violation(rgw_env, req_start_time, cur_time); 
+          handle_sla_violation(req, req_start_time, cur_time); 
         } 
         ++iter;
       }
