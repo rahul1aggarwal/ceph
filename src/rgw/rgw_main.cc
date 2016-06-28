@@ -203,6 +203,17 @@ struct RGWRequest
 
 };
 
+struct RGWProcessEnv {
+  RGWRados *store;
+  RGWREST *rest;
+  OpsLogSocket *olog;
+  int port;
+};
+
+
+static int post_process_request(RGWRados *store, RGWREST *rest, RGWRequest *req, OpsLogSocket *olog, 
+                                RGWHandler *handler, bool should_log, int ret);
+
 enum RGWRequestSLAStatus {
   ACTIVE, // request is currently active from SLA perspective
   ERROR, // request has gone into error
@@ -210,26 +221,79 @@ enum RGWRequestSLAStatus {
   SLA_NOT_MET, // request has not met the SLA
 };
 
+
 /* This is a wrapper to hold all the objects necessary to process a request */
 class RGWRequestSLA {
 
-  friend class RGWSLAManager;
-
+  private:
   utime_t req_start_time; // start time when a civetweb thread started processing this request
   RGWRequest *req; // Request object
   RGWRequestSLAStatus sla_status; // SLA status of this request
   RGWHandler *handler; // S3 handler in our case
- 
+  bool should_log;
+  Mutex *r_mutex; // mutex to synchronize state changes 
+
   public :
 
-  RGWRequestSLA() {
+  RGWRequestSLA(RGWRequest* req, RGWHandler* handler) : req(req), handler(handler) {
+    r_mutex = new Mutex("sla_req_mutex");
+    sla_status = ACTIVE;
   }
 
   virtual ~RGWRequestSLA() {}
 
+  utime_t get_start_time() {
+    return req_start_time;
+  }
+
+  RGWRequest *get_request() {
+    return req;
+  }
+
+  RGWRequestSLAStatus get_cur_status() {
+    r_mutex->Lock();
+    return sla_status;
+    r_mutex->Unlock();
+  }
+
+  void set_cur_status(RGWRequestSLAStatus status) {
+    r_mutex->Lock();
+    sla_status = status;
+    r_mutex->Unlock();
+  }
+ 
+  void handle_sla_violation(RGWProcessEnv* env, utime_t time_to_meet_sla, utime_t cur_time) {
+    // abort early, post process 
+    r_mutex->Lock();
+    if(sla_status == ACTIVE) {
+      abort_early(req->s, NULL, -ERR_INTERNAL_ERROR);
+      post_process_request(env->store, env->rest, req, env->olog, handler, should_log, 0);
+      /* only an active request can violate sla */
+      sla_status = SLA_NOT_MET;
+    }
+    r_mutex->Unlock();
+  }
+
+
   
   
 };
+
+/* wrapper to hold all objects necessary to process a request which has violated the SLA */
+struct RGWSLAViolationInfo {
+  RGWProcessEnv* env;
+  RGWRequestSLA* req;
+  utime_t time_to_meet_sla;
+  utime_t cur_time;
+};
+
+
+void* handle_sla_violation_func(void* sla_violation_info) {
+  RGWSLAViolationInfo* sla_info = (RGWSLAViolationInfo*) sla_violation_info;
+  sla_info->req->handle_sla_violation(sla_info->env, sla_info->time_to_meet_sla, sla_info->cur_time);
+  delete(sla_info);
+  return NULL;
+}
 
 class RGWSLAManager {
 
@@ -238,9 +302,10 @@ class RGWSLAManager {
 
   Mutex *m_mutex; // mutex to synchronize access to the map
   
-  struct RGWProcessEnv *rgw_env; // RGW environment (civetweb)
+  RGWProcessEnv* rgw_env; // RGW environment (civetweb)
   
   public :
+
   RGWSLAManager(RGWProcessEnv *env) : rgw_env(env) {
     m_mutex = new Mutex("sla_map_mutex");
     /* populate the sla config array */
@@ -279,12 +344,19 @@ class RGWSLAManager {
       m_mutex->Lock();
       /* get current time */
       utime_t cur_time = ceph_clock_now(g_ceph_context);
+      uint64_t cur_time_in_msec = cur_time.to_msec();
       /* iterate over the map and check sla for each request */
       map<string, RGWRequestSLA*>::iterator iter = requests_map.begin();
       while(iter != requests_map.end()) {
         RGWRequestSLA *req = iter->second;
-        uint32_t sla_time = get_sla_time(req);
-        
+        utime_t req_start_time = req->get_start_time();
+        uint32_t sla_time = get_sla_time(req); // in seconds
+        req_start_time.tv.tv_sec += sla_time;
+        uint64_t time_to_meet_sla_in_msec = req_start_time.to_msec();   
+        if(cur_time_in_msec > time_to_meet_sla_in_msec) {
+          /* SLA not met, abort */
+          req->handle_sla_violation(rgw_env, req_start_time, cur_time); 
+        } 
         ++iter;
       }
       m_mutex->Unlock();
@@ -294,16 +366,25 @@ class RGWSLAManager {
 
   private :
   uint32_t get_sla_time(RGWRequestSLA *req) {
-    return sla_config_times[req->req->op->get_type()];
+    return sla_config_times[req->get_request()->op->get_type()];
   }
-  int post_process_request();
+
+
+  void handle_sla_violation(RGWRequestSLA* req, utime_t req_start_time, utime_t cur_time) {
+    RGWSLAViolationInfo* sla_violation_info = new RGWSLAViolationInfo();
+    sla_violation_info->env = rgw_env;
+    sla_violation_info->req = req;
+    sla_violation_info->time_to_meet_sla = req_start_time;
+    sla_violation_info->cur_time = cur_time;
+    pthread_t sla_violation_thread;
+    pthread_create(&sla_violation_thread, NULL, handle_sla_violation_func, (void *) sla_violation_info);
+  }
   
   
 };
  
 void *sla_thread_func(void *args) 
 {
-  string frontends = g_conf->rgw_frontends;
   RGWSLAManager *mgr = (RGWSLAManager *) args;
   mgr->run();
   return NULL;
@@ -348,13 +429,6 @@ struct RGWFCGXRequest : public RGWRequest {
     FCGX_Finish_r(fcgx);
     qr->enqueue(fcgx);
   }
-};
-
-struct RGWProcessEnv {
-  RGWRados *store;
-  RGWREST *rest;
-  OpsLogSocket *olog;
-  int port;
 };
 
 class RGWProcess {
